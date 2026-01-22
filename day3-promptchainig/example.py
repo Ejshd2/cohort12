@@ -6,13 +6,8 @@ load_dotenv()
 #-------------------------------------
 #모델 설정
 #-------------------------------------
-#from langchain_anthropic import ChatAnthropic
-#llm = ChatAnthropic(model="claude-sonnet-4-5-20250929")
-
-from langchain_openai import ChatOpenAI
-llm = ChatOpenAI(
-    model="gpt-5-nano",
-)
+from langchain_anthropic import ChatAnthropic
+llm = ChatAnthropic(model="claude-sonnet-4-5-20250929")
 
 #-------------------------------------
 #Prompt chaining : “이전 LLM 호출의 결과를 다음 호출 입력으로 넘기는” 순차 처리.
