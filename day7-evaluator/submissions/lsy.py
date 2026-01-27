@@ -5,10 +5,7 @@ load_dotenv()
 
 #-------------------------------------
 #모델 설정
-#-------------------------------------
-#from langchain_anthropic import ChatAnthropic
-#llm = ChatAnthropic(model="claude-sonnet-4-5-20250929")
-
+#------------------------------------
 from langchain_openai import ChatOpenAI
 llm = ChatOpenAI(
     model="gpt-5-nano",
@@ -16,113 +13,114 @@ llm = ChatOpenAI(
 
 from typing_extensions import TypedDict
 from langgraph.graph import StateGraph, START, END
-
-#-------------------------------------
-#Routing (입력값 처리 후 컨텍스트별 작업으로 전달)
-#-------------------------------------
-from typing_extensions import Literal 
-from langchain.messages import HumanMessage, SystemMessage
 from pydantic import BaseModel, Field
+from typing import Literal #주어진 보기 안에서 선택하도록 강제
 
-# LLM이 반드시 step에 "poem"/"story"/"joke" 중 하나를 내게 강제.
-class Route(BaseModel):
-    step: Literal["poem", "story", "joke"] = Field(
-        None, description="유저의 입력에 대해 poem/stroy/joke 중 하나를 선택하여라"
-    )
+#-------------------------------------
+#Evaluator-optimizer(평가-개선 루프) *예제와 다르게 개선 루프 3회 제한
+#-------------------------------------
+# Graph state
 
-
-# 구조화 출력 강제된 라우터
-router = llm.with_structured_output(Route)
-
-
-# State
 class State(TypedDict):
-    input: str #사용자 입력
-    decision: str #분기 결정
-    output: str #출력
+    joke: str
+    topic: str
+    feedback: str
+    funny_or_not: str
+    attempts: int  # 개선 시도 횟수 카운터
 
 
-# Nodes
-def llm_call_1(state: State):
-    """Write a story"""
-
-    result = llm.invoke(state["input"])
-    return {"output": result.content}
-
-
-def llm_call_2(state: State):
-    """Write a joke"""
-
-    result = llm.invoke(state["input"])
-    return {"output": result.content}
-
-
-def llm_call_3(state: State):
-    """Write a poem"""
-
-    result = llm.invoke(state["input"])
-    return {"output": result.content}
-
-
-# 라우터 노드
-def llm_call_router(state: State):
-    """Route the input to the appropriate node"""
-
-    # Run the augmented LLM with structured output to serve as routing logic
-    decision = router.invoke(
-        [
-            SystemMessage(
-                content="유저의 입력에 대해 poem/stroy/joke 중 하나를 선택하여라"
-            ),
-            HumanMessage(content=state["input"]),
-        ]
+# 평가 결과를 구조화할 스키마(Feedback)
+class Feedback(BaseModel):
+    # evaluator의 출력 형식을 강제로 고정
+    grade: Literal["funny", "not funny"] = Field(
+        description="Decide if the joke is funny or not.",
     )
-    print(f"Decision: {decision.step}")
-    return {"decision": decision.step}
+    feedback: str = Field(
+        description="If the joke is not funny, provide feedback on how to improve it.",
+    )
 
 
-# Conditional edge function to route to the appropriate node
-def route_decision(state: State):
-    # Return the node name you want to visit next
-    if state["decision"] == "story":
-        return "llm_call_1"
-    elif state["decision"] == "joke":
-        return "llm_call_2"
-    elif state["decision"] == "poem":
-        return "llm_call_3"
+# evaluator(평가 LLM) 만들기
+evaluator = llm.with_structured_output(Feedback)
+
+
+# 노드 1: llm_call_generator (생성기)
+def llm_call_generator(state: State):
+    """LLM generates a joke"""
+
+    # 시도 횟수 카운트 (없으면 0으로 시작)
+    current_attempts = state.get("attempts") or 0
+    new_attempts = current_attempts + 1
+
+    if state.get("feedback"):
+        msg = llm.invoke(
+            f"Write a joke about {state['topic']} but take into account the feedback: {state['feedback']}"
+        )
+    else:
+        msg = llm.invoke(f"Write a joke about {state['topic']}")
+    
+    # 어떤 내용을 생성했는지 출력
+    print(f"[GENERATE] Joke {new_attempts}: {msg.content[:100]}\n")
+
+    return {"joke": msg.content, "attempts": new_attempts}
+
+
+# 노드 2: llm_call_evaluator (평가자)
+def llm_call_evaluator(state: State):
+    """LLM evaluates the joke"""
+
+    grade = evaluator.invoke(f"Grade the joke {state['joke']}")
+    
+    # 어떤 내용을 평가했는지 출력
+    print(f"[EVALUATE] Joke {state['attempts']}: {grade.grade}\n")
+
+    return {"funny_or_not": grade.grade, "feedback": grade.feedback}
+
+
+# 라우팅 함수
+def route_joke(state: State):
+    """Route back to joke generator or end based upon feedback from the evaluator"""
+
+    if state["funny_or_not"] == "funny":
+        print("[END] 웃긴 농담으로 판정되어 종료")
+
+        return "Accepted"
+    elif state["funny_or_not"] == "not funny":
+        # 3회 이상 시도했다면 여기서 멈춤 (Accepted 리턴 -> END)
+        if state.get("attempts", 0) >= 3:
+            print("[END] 3회 개선 시도 도달 → 강제 종료")
+            return "Accepted"
+
+        print("[LOOP] 개선 피드백 반영하여 재시도")    
+        return "Rejected + Feedback"
 
 
 # Build workflow
-router_builder = StateGraph(State)
+optimizer_builder = StateGraph(State)
 
-# Add nodes
-router_builder.add_node("llm_call_1", llm_call_1)
-router_builder.add_node("llm_call_2", llm_call_2)
-router_builder.add_node("llm_call_3", llm_call_3)
-router_builder.add_node("llm_call_router", llm_call_router)
+# Add the nodes
+optimizer_builder.add_node("llm_call_generator", llm_call_generator)
+optimizer_builder.add_node("llm_call_evaluator", llm_call_evaluator)
 
 # Add edges to connect nodes
-router_builder.add_edge(START, "llm_call_router")
-router_builder.add_conditional_edges(
-    "llm_call_router",
-    route_decision,
-    {  # Name returned by route_decision : Name of next node to visit
-        "llm_call_1": "llm_call_1",
-        "llm_call_2": "llm_call_2",
-        "llm_call_3": "llm_call_3",
+optimizer_builder.add_edge(START, "llm_call_generator")
+optimizer_builder.add_edge("llm_call_generator", "llm_call_evaluator")
+optimizer_builder.add_conditional_edges(
+    "llm_call_evaluator",
+    route_joke,
+    {  # Name returned by route_joke : Name of next node to visit
+        "Accepted": END,
+        "Rejected + Feedback": "llm_call_generator",
     },
 )
-router_builder.add_edge("llm_call_1", END)
-router_builder.add_edge("llm_call_2", END)
-router_builder.add_edge("llm_call_3", END)
 
-# Compile workflow
-router_workflow = router_builder.compile()
+# Compile the workflow
+optimizer_workflow = optimizer_builder.compile()
 
 # Show the workflow
 print("Here is the mermaid graph syntax. You can paste it into https://mermaid.live/ :") #사이트 들어가서 코드 붙여넣기
-print(router_workflow.get_graph(xray=True).draw_mermaid())
+print(optimizer_workflow.get_graph(xray=True).draw_mermaid())
 
 # Invoke
-answer = router_workflow.invoke({"input": "고양이에 대해 짧은 농담을 3개 적어줘."})
-print(f"\nAnswer: {answer}")
+state = optimizer_workflow.invoke({"topic": "Cats"})
+print(state["joke"])
